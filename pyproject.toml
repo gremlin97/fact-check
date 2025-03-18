@@ -14,7 +14,8 @@ dependencies = [
     "tqdm",
     "python-dotenv",
     "docling",
-    "torch (>=2.6.0,<3.0.0)"
+    "torch (>=2.6.0,<3.0.0)",
+    "pinecone-text (>=0.10.0,<0.11.0)"
 ]
 
 [tool.poetry]

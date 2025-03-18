@@ -140,10 +140,10 @@ def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
         logger.error(f"Error searching for evidence: {e}")
         return []
 
-def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> str:
+def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Generate an explanation of how the evidence supports the claim using Gemini"""
     if not evidence_list:
-        return "No supporting evidence was found for this claim."
+        return {"general_analysis": "No supporting evidence was found for this claim.", "evidence_assessments": []}
     
     try:
         # Prepare evidence texts for the prompt
@@ -151,7 +151,8 @@ def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> str
         for i, evidence in enumerate(evidence_list):
             text = evidence.get("text", "")
             source = evidence.get("document_name", "Unknown source")
-            evidence_texts.append(f"Evidence {i+1} (from {source}):\n{text}")
+            paragraph_index = evidence.get("paragraph_index", -1)
+            evidence_texts.append(f"Evidence {i+1} (from {source}, paragraph index: {paragraph_index}):\n{text}")
         
         evidence_combined = "\n\n".join(evidence_texts)
         
@@ -164,6 +165,12 @@ def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> str
         EVIDENCE:
         {evidence_combined}
         
+        Important context about the evidence:
+        - These text chunks were retrieved using semantic similarity to the claim
+        - The retrieval process is based on embedding similarity, not literal text matching
+        - Some chunks may be completely irrelevant or contain noise despite being retrieved
+        - The paragraph index indicates which section of the document the text came from
+        
         Please provide a concise explanation of how the evidence relates to the claim. 
         Consider:
         1. Does the evidence directly support the claim?
@@ -172,20 +179,117 @@ def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> str
         4. What specific aspects of the claim are addressed by the evidence?
         5. Are there any limitations or caveats in the evidence?
         
-        Format your response as a clear, objective analysis without using bullet points or numbered lists.
+        Then, for EACH piece of evidence, provide:
+        1. A relevancy score (1-5, where 5 is highly relevant and 1 is completely irrelevant)
+           - Only assign high scores (4-5) when the evidence truly contains information relevant to the claim
+           - Assign low scores (1-2) when the evidence is noise or unrelated despite appearing in search results
+        2. An assessment of whether the evidence agrees, disagrees, partially agrees, or partially disagrees with the claim
+           - If the evidence is irrelevant (score 1-2), mark it as "Not applicable"
+        3. A brief reasoning explaining your assessment
+        
+        Format your response with a general analysis first, followed by the structured assessment of each evidence item.
+        
+        Example format:
+        [General Analysis]
+        
+        [Evidence Assessments]
+        Evidence 1:
+        - Relevancy Score: X/5
+        - Assessment: [Agrees/Disagrees/Partially Agrees/Partially Disagrees/Not applicable]
+        - Reasoning: [Brief explanation]
+        
+        Evidence 2:
+        - Relevancy Score: X/5
+        - Assessment: [Agrees/Disagrees/Partially Agrees/Partially Disagrees/Not applicable]
+        - Reasoning: [Brief explanation]
         """
         
         # Generate explanation using Gemini
         model = genai.GenerativeModel('gemini-1.5-pro')
         response = model.generate_content(prompt)
         
-        # Extract and return the explanation
-        explanation = response.text.strip()
-        return explanation
+        # Extract the explanation
+        explanation_text = response.text.strip()
+        
+        # Parse the response into structured format
+        # First, split into general analysis and evidence assessments
+        parts = explanation_text.split("[Evidence Assessments]", 1)
+        
+        general_analysis = parts[0].replace("[General Analysis]", "").strip()
+        
+        # Initialize evidence assessments list
+        evidence_assessments = []
+        
+        # If we have evidence assessments section
+        if len(parts) > 1:
+            # Split by "Evidence X:" pattern
+            assessment_texts = parts[1].strip().split("\nEvidence ")
+            for assessment_text in assessment_texts:
+                if not assessment_text.strip():
+                    continue
+                
+                # If it doesn't start with a number (first split result), add "Evidence " back
+                if not assessment_text.startswith("1:") and not assessment_text.startswith("2:") and not assessment_text.startswith("3:") and not assessment_text.startswith("4:") and not assessment_text.startswith("5:"):
+                    assessment_text = "Evidence " + assessment_text
+                
+                # Extract evidence number
+                evidence_num = 0
+                if ":" in assessment_text.split("\n")[0]:
+                    try:
+                        evidence_num = int(assessment_text.split(":")[0].replace("Evidence ", "").strip())
+                    except ValueError:
+                        pass
+                
+                # Get paragraph index from the corresponding evidence item
+                paragraph_index = -1
+                if 0 < evidence_num <= len(evidence_list):
+                    paragraph_index = evidence_list[evidence_num-1].get("paragraph_index", -1)
+                
+                # Extract relevancy score
+                relevancy_score = 0
+                relevancy_line = next((line for line in assessment_text.split("\n") if "Relevancy Score:" in line), "")
+                if relevancy_line:
+                    try:
+                        relevancy_score = int(relevancy_line.split("Relevancy Score:")[1].split("/")[0].strip())
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Extract assessment
+                assessment = ""
+                assessment_line = next((line for line in assessment_text.split("\n") if "Assessment:" in line), "")
+                if assessment_line:
+                    assessment = assessment_line.split("Assessment:")[1].strip()
+                
+                # Extract reasoning
+                reasoning = ""
+                reasoning_line = next((line for line in assessment_text.split("\n") if "Reasoning:" in line), "")
+                if reasoning_line:
+                    reasoning = reasoning_line.split("Reasoning:")[1].strip()
+                
+                # Add to evidence assessments
+                if evidence_num > 0:
+                    evidence_assessments.append({
+                        "evidence_number": evidence_num,
+                        "paragraph_index": paragraph_index,  # Include paragraph index
+                        "relevancy_score": relevancy_score,
+                        "assessment": assessment,
+                        "reasoning": reasoning
+                    })
+        
+        # Return structured result
+        return {
+            "general_analysis": general_analysis,
+            "evidence_assessments": evidence_assessments,
+            "raw_explanation": explanation_text  # Keep the raw text as well
+        }
     
     except Exception as e:
         logger.error(f"Error generating explanation: {e}")
-        return "Unable to generate explanation due to an error."
+        return {
+            "general_analysis": "Unable to generate explanation due to an error.",
+            "evidence_assessments": [],
+            "raw_explanation": f"Error: {str(e)}"
+        }
 
 def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, include_explanation: bool = True):
     """Verify claims against the Pinecone index and save results"""
@@ -207,7 +311,7 @@ def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, inc
         evidence = search_evidence(preprocessed_claim, top_k=top_k)
         
         # Generate explanation if requested - use preprocessed claim
-        explanation = ""
+        explanation = {}
         if include_explanation and evidence:
             # Log the preprocessed claim
             log_text = preprocessed_claim if len(preprocessed_claim) < 200 else f"{preprocessed_claim[:197]}..."
@@ -237,11 +341,28 @@ def format_custom_output(results: List[Dict[str, Any]]) -> Dict[str, List[Dict[s
     for result in results:
         claim_text = result.get("claim", "")
         evidence_list = result.get("evidence", [])
+        explanation = result.get("explanation", {})
         
         # Create claim object with match sources
         claim_obj = {
             "claim": claim_text,
         }
+        
+        # Add explanations and assessments if available
+        if explanation:
+            claim_obj["analysis"] = explanation.get("general_analysis", "")
+            
+            # Add assessment for each evidence
+            evidence_assessments = explanation.get("evidence_assessments", [])
+            for assessment in evidence_assessments:
+                evidence_num = assessment.get("evidence_number", 0)
+                if 0 < evidence_num <= len(evidence_list):
+                    assessment_key = f"assessment_{evidence_num}"
+                    claim_obj[assessment_key] = {
+                        "relevancy_score": assessment.get("relevancy_score", 0),
+                        "agreement": assessment.get("assessment", ""),
+                        "reasoning": assessment.get("reasoning", "")
+                    }
         
         # Add match sources
         for i, evidence in enumerate(evidence_list):
@@ -268,15 +389,33 @@ def format_results(results: List[Dict[str, Any]], output_format: str = "md") -> 
         for i, result in enumerate(results):
             claim = result.get("claim", "")
             evidence = result.get("evidence", [])
-            explanation = result.get("explanation", "")
+            explanation = result.get("explanation", {})
             
             output += f"## Claim {i+1}\n\n"
             output += f"**{claim}**\n\n"
             
             # Add explanation if available
             if explanation:
-                output += "### Analysis\n\n"
-                output += f"{explanation}\n\n"
+                general_analysis = explanation.get("general_analysis", "")
+                evidence_assessments = explanation.get("evidence_assessments", [])
+                
+                if general_analysis:
+                    output += "### Analysis\n\n"
+                    output += f"{general_analysis}\n\n"
+                
+                if evidence_assessments:
+                    output += "### Evidence Assessments\n\n"
+                    for assessment in evidence_assessments:
+                        evidence_num = assessment.get("evidence_number", 0)
+                        paragraph_index = assessment.get("paragraph_index", -1)
+                        relevancy_score = assessment.get("relevancy_score", 0)
+                        assessment_value = assessment.get("assessment", "")
+                        reasoning = assessment.get("reasoning", "")
+                        
+                        output += f"#### Evidence {evidence_num} (Paragraph Index: {paragraph_index})\n\n"
+                        output += f"- **Relevancy Score**: {relevancy_score}/5\n"
+                        output += f"- **Assessment**: {assessment_value}\n"
+                        output += f"- **Reasoning**: {reasoning}\n\n"
             
             if evidence:
                 output += "### Supporting Evidence\n\n"
@@ -294,7 +433,6 @@ def format_results(results: List[Dict[str, Any]], output_format: str = "md") -> 
                 output += "---\n\n"
         
         return output
-
     
     else:  # Plain text
         # Format as plain text
@@ -304,16 +442,35 @@ def format_results(results: List[Dict[str, Any]], output_format: str = "md") -> 
         for i, result in enumerate(results):
             claim = result.get("claim", "")
             evidence = result.get("evidence", [])
-            explanation = result.get("explanation", "")
+            explanation = result.get("explanation", {})
             
             output += f"CLAIM {i+1}:\n"
             output += f"{claim}\n\n"
             
             # Add explanation if available
             if explanation:
-                output += "ANALYSIS:\n"
-                output += "-" * 40 + "\n"
-                output += f"{explanation}\n\n"
+                general_analysis = explanation.get("general_analysis", "")
+                evidence_assessments = explanation.get("evidence_assessments", [])
+                
+                if general_analysis:
+                    output += "ANALYSIS:\n"
+                    output += "-" * 40 + "\n"
+                    output += f"{general_analysis}\n\n"
+                
+                if evidence_assessments:
+                    output += "EVIDENCE ASSESSMENTS:\n"
+                    output += "-" * 40 + "\n"
+                    for assessment in evidence_assessments:
+                        evidence_num = assessment.get("evidence_number", 0)
+                        paragraph_index = assessment.get("paragraph_index", -1)
+                        relevancy_score = assessment.get("relevancy_score", 0)
+                        assessment_value = assessment.get("assessment", "")
+                        reasoning = assessment.get("reasoning", "")
+                        
+                        output += f"Evidence {evidence_num} (Paragraph Index: {paragraph_index}):\n"
+                        output += f"- Relevancy Score: {relevancy_score}/5\n"
+                        output += f"- Assessment: {assessment_value}\n"
+                        output += f"- Reasoning: {reasoning}\n\n"
             
             if evidence:
                 output += "SUPPORTING EVIDENCE:\n\n"
