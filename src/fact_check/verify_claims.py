@@ -35,42 +35,8 @@ def load_claims(claims_file: str) -> List[Dict[str, str]]:
 
 def preprocess_claim(claim: str) -> str:
     """Preprocess the claim by expanding or rephrasing it for better retrieval"""
-    # Full marketing document context
-    full_context = """Flublok - Important Information
-    IMPORTANT SAFETY INFORMATION
-    Appropriate medical treatment must be immediately available to manage potential anaphylactic reactions following administration of Flublok.
-    Before administration, refer to the full Prescribing Information [here].
-    Key Features of Flublok
-    1. AN EXACT STRAIN MATCH
-    The only recombinant flu vaccine with known and exact antigen content.
-    Ensures identical antigenic match with WHO- and FDA-selected flu strains.
-    2. 3x THE ANTIGEN
-    Flublok contains 3x the hemagglutinin (HA) antigen content of standard-dose flu vaccines.
-    Higher HA content has been linked to greater immunogenicity compared to standard-dose flu vaccines.†
-    3. AVOIDS MUTATIONS
-    Unlike cell- and egg-based flu vaccines, Flublok prevents the potential development of mutations during production, which may reduce effectiveness.
-    4. MAY PROVIDE CROSS-PROTECTION
-    Recombinant technology leads to a broader immune response.
-    This may provide cross-protection, even in a mismatch season.*
-    5. MAY INDUCE A MORE ROBUST ANTIBODY RESPONSE
-    A CDC study (January 2024) suggests that vaccination with a higher-dose recombinant flu vaccine may induce a more robust antibody response than egg-based standard-dose vaccines.
-    Flublok Combines the Advantages of Recombinant Technology with a Higher Dose
-    Flublok merges the benefits of recombinant vaccine technology with an increased antigen dose, ensuring a stronger immune response.
-    Additional Notes
-    Flublok Quadrivalent was evaluated against Fluarix (Quadrivalent Standard-Dose Vaccine) in pivotal trials.
-    Flublok and Flublok Trivalent are produced using the same process and have overlapping compositions.
-    Flublok is manufactured using Baculovirus Expression Vector System (BEVS) in insect cells.
-    BEVS-produced recombinant HA antigens induce significantly higher levels of broadly cross-reactive antibodies against highly conserved regions of HA than egg-derived vaccines.
-    References
-    † Flublok contains 45 micrograms (mcg) of HA per strain vs 15 mcg per strain in standard-dose influenza vaccines.
-
-    Abbreviations:
-    CDC = Centers for Disease Control and Prevention
-    FDA = U.S. Food and Drug Administration
-    WHO = World Health Organization"""
-
-    # Include the specific user-provided context and the full marketing document
-    return f"In medical literature, is it true that {claim}? Consider this context from marketing materials: {full_context}"
+    # Create a more neutral prompt without full marketing context
+    return f"In medical literature, is it true that {claim}?"
 
 def get_embedding(text: str) -> Dict[str, Any]:
     """Get dense and sparse embeddings for a text using Gemini and BM25"""
@@ -112,7 +78,7 @@ def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
         # Prepare query parameters
         query_params = {
             "vector": embeddings["dense"],
-            "top_k": top_k,
+            "top_k": top_k * 3,  # Retrieve more initially to ensure diversity
             "include_metadata": True
         }
         
@@ -124,17 +90,43 @@ def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
         index = pc.Index(INDEX_NAME)
         results = index.query(**query_params)
         
+        # Add detailed logging of all returned matches
+        logger.info(f"Total matches found: {len(results.matches)}")
+        doc_counts_total = {}
+        for i, match in enumerate(results.matches):
+            doc_name = match.metadata.get("document_name", "Unknown")
+            doc_counts_total[doc_name] = doc_counts_total.get(doc_name, 0) + 1
+        logger.info(f"Sources in initial results: {doc_counts_total}")
+        
         # Extract and return results
         evidence = []
+        doc_counts = {}  # Track count of documents
+        
         for match in results.matches:
+            doc_name = match.metadata.get("document_name", "Unknown")
+            
+            # Skip if we already have 2 entries from this document
+            if doc_counts.get(doc_name, 0) >= 2:
+                logger.info(f"Skipping entry from {doc_name} - already have enough from this source")
+                continue
+                
             evidence.append({
                 "score": match.score,
-                "document_name": match.metadata.get("document_name", "Unknown"),
+                "document_name": doc_name,
                 "document_path": match.metadata.get("document_path", "Unknown"),
                 "paragraph_index": match.metadata.get("paragraph_index", -1),
                 "text": match.metadata.get("text", "No text available")
             })
+            
+            # Increment the count for this document
+            doc_counts[doc_name] = doc_counts.get(doc_name, 0) + 1
+            
+            # Stop once we have enough diverse evidence
+            if len(evidence) >= top_k:
+                break
         
+        # Log final selection
+        logger.info(f"Final evidence selection sources: {doc_counts}")
         return evidence
     except Exception as e:
         logger.error(f"Error searching for evidence: {e}")
@@ -291,7 +283,7 @@ def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> Dic
             "raw_explanation": f"Error: {str(e)}"
         }
 
-def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, include_explanation: bool = True):
+def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, include_explanation: bool = True, ensure_source_diversity: bool = True):
     """Verify claims against the Pinecone index and save results"""
     # Load claims
     claims = load_claims(claims_file)
@@ -309,6 +301,30 @@ def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, inc
         
         # Search for evidence using preprocessed claim
         evidence = search_evidence(preprocessed_claim, top_k=top_k)
+        
+        # If ensuring source diversity and we have biased results, try again with tweaked query
+        if ensure_source_diversity:
+            # Check if all results are from same source
+            source_counts = {}
+            for e in evidence:
+                doc_name = e.get("document_name", "Unknown")
+                source_counts[doc_name] = source_counts.get(doc_name, 0) + 1
+            
+            # If we have strong source bias, retry with more neutral query
+            if len(source_counts) <= 1 and evidence:
+                logger.info(f"All evidence from same source. Trying more neutral query.")
+                neutral_claim = f"In medicine, what is known about {claim_text}?"
+                backup_evidence = search_evidence(neutral_claim, top_k=top_k)
+                
+                # Create set of backup sources for comparison
+                backup_sources = set()
+                for e in backup_evidence:
+                    backup_sources.add(e.get("document_name", "Unknown"))
+                
+                # Merge results if we got different sources
+                if len(backup_sources) > len(source_counts):
+                    # Replace some results with backup evidence to increase diversity
+                    evidence = evidence[:top_k//2] + backup_evidence[:top_k//2]
         
         # Generate explanation if requested - use preprocessed claim
         explanation = {}
