@@ -47,7 +47,7 @@
       "filtering_log": [
         {
           "evidence_number": 1,
-          "filter": "Relevancy Score Filter", 
+          "filter": "Relevancy Score Filter",
           "reason": "Score 1 below threshold 3.0"
         },
         {

@@ -69,7 +69,7 @@ def get_embedding(text: str) -> Dict[str, Any]:
         logger.error(f"Error generating embedding: {e}")
 
 
-def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
+def search_evidence(claim: str, top_k: int = 5, max_duplicates_per_source: int = 2) -> List[Dict[str, Any]]:
     """Search for evidence supporting a claim in the Pinecone index using hybrid search"""
     try:
         # Get embeddings for the claim
@@ -105,8 +105,8 @@ def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
         for match in results.matches:
             doc_name = match.metadata.get("document_name", "Unknown")
             
-            # Skip if we already have 2 entries from this document
-            if doc_counts.get(doc_name, 0) >= 2:
+            # Skip if we already have max_duplicates_per_source entries from this document
+            if doc_counts.get(doc_name, 0) >= max_duplicates_per_source:
                 logger.info(f"Skipping entry from {doc_name} - already have enough from this source")
                 continue
                 
@@ -283,7 +283,7 @@ def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> Dic
             "raw_explanation": f"Error: {str(e)}"
         }
 
-def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, include_explanation: bool = True, ensure_source_diversity: bool = True):
+def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, include_explanation: bool = True, ensure_source_diversity: bool = True, max_duplicates_per_source: int = 2):
     """Verify claims against the Pinecone index and save results"""
     # Load claims
     claims = load_claims(claims_file)
@@ -300,7 +300,7 @@ def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, inc
         preprocessed_claim = preprocess_claim(claim_text)
         
         # Search for evidence using preprocessed claim
-        evidence = search_evidence(preprocessed_claim, top_k=top_k)
+        evidence = search_evidence(preprocessed_claim, top_k=top_k, max_duplicates_per_source=max_duplicates_per_source)
         
         # If ensuring source diversity and we have biased results, try again with tweaked query
         if ensure_source_diversity:
@@ -314,7 +314,7 @@ def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, inc
             if len(source_counts) <= 1 and evidence:
                 logger.info(f"All evidence from same source. Trying more neutral query.")
                 neutral_claim = f"In medicine, what is known about {claim_text}?"
-                backup_evidence = search_evidence(neutral_claim, top_k=top_k)
+                backup_evidence = search_evidence(neutral_claim, top_k=top_k, max_duplicates_per_source=max_duplicates_per_source)
                 
                 # Create set of backup sources for comparison
                 backup_sources = set()
@@ -524,6 +524,10 @@ def main():
                         help="Number of evidence items to retrieve per claim")
     parser.add_argument("--no_explanation", action="store_true",
                         help="Skip generating explanations for claims")
+    parser.add_argument("--no_source_diversity", action="store_true",
+                        help="Disable source diversity checks")
+    parser.add_argument("--max_duplicates_per_source", type=int, default=5,
+                        help="Maximum number of evidence items allowed from the same source")
     args = parser.parse_args()
     
     # Verify claims
@@ -531,7 +535,9 @@ def main():
         claims_file=args.claims_file, 
         output_file=args.output_file, 
         top_k=args.top_k,
-        include_explanation=not args.no_explanation
+        include_explanation=not args.no_explanation,
+        ensure_source_diversity=not args.no_source_diversity,
+        max_duplicates_per_source=args.max_duplicates_per_source
     )
     
     # Generate and save custom format if requested
