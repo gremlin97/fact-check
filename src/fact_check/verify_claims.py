@@ -1,12 +1,17 @@
 import os
 import json
+import logging
 import argparse
-from pathlib import Path
 from typing import List, Dict, Any
 import google.generativeai as genai
 from pinecone import Pinecone
 from dotenv import load_dotenv
 from tqdm import tqdm
+from pinecone_text.sparse import BM25Encoder
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -28,35 +33,96 @@ def load_claims(claims_file: str) -> List[Dict[str, str]]:
         data = json.load(f)
     return data.get("claims", [])
 
-def get_embedding(text: str) -> List[float]:
-    """Get embedding for a text using Gemini"""
+def preprocess_claim(claim: str) -> str:
+    """Preprocess the claim by expanding or rephrasing it for better retrieval"""
+    # Full marketing document context
+    full_context = """Flublok - Important Information
+    IMPORTANT SAFETY INFORMATION
+    Appropriate medical treatment must be immediately available to manage potential anaphylactic reactions following administration of Flublok.
+    Before administration, refer to the full Prescribing Information [here].
+    Key Features of Flublok
+    1. AN EXACT STRAIN MATCH
+    The only recombinant flu vaccine with known and exact antigen content.
+    Ensures identical antigenic match with WHO- and FDA-selected flu strains.
+    2. 3x THE ANTIGEN
+    Flublok contains 3x the hemagglutinin (HA) antigen content of standard-dose flu vaccines.
+    Higher HA content has been linked to greater immunogenicity compared to standard-dose flu vaccines.†
+    3. AVOIDS MUTATIONS
+    Unlike cell- and egg-based flu vaccines, Flublok prevents the potential development of mutations during production, which may reduce effectiveness.
+    4. MAY PROVIDE CROSS-PROTECTION
+    Recombinant technology leads to a broader immune response.
+    This may provide cross-protection, even in a mismatch season.*
+    5. MAY INDUCE A MORE ROBUST ANTIBODY RESPONSE
+    A CDC study (January 2024) suggests that vaccination with a higher-dose recombinant flu vaccine may induce a more robust antibody response than egg-based standard-dose vaccines.
+    Flublok Combines the Advantages of Recombinant Technology with a Higher Dose
+    Flublok merges the benefits of recombinant vaccine technology with an increased antigen dose, ensuring a stronger immune response.
+    Additional Notes
+    Flublok Quadrivalent was evaluated against Fluarix (Quadrivalent Standard-Dose Vaccine) in pivotal trials.
+    Flublok and Flublok Trivalent are produced using the same process and have overlapping compositions.
+    Flublok is manufactured using Baculovirus Expression Vector System (BEVS) in insect cells.
+    BEVS-produced recombinant HA antigens induce significantly higher levels of broadly cross-reactive antibodies against highly conserved regions of HA than egg-derived vaccines.
+    References
+    † Flublok contains 45 micrograms (mcg) of HA per strain vs 15 mcg per strain in standard-dose influenza vaccines.
+
+    Abbreviations:
+    CDC = Centers for Disease Control and Prevention
+    FDA = U.S. Food and Drug Administration
+    WHO = World Health Organization"""
+
+    # Include the specific user-provided context and the full marketing document
+    return f"In medical literature, is it true that {claim}? Consider this context from marketing materials: {full_context}"
+
+def get_embedding(text: str) -> Dict[str, Any]:
+    """Get dense and sparse embeddings for a text using Gemini and BM25"""
     try:
+        # Get dense embedding
         result = genai.embed_content(
             model="models/embedding-001",
             content=text,
             task_type="retrieval_query"
-            # No title parameter with retrieval_query
         )
-        return result["embedding"]
+        dense_embedding = result["embedding"]
+        
+        # Generate sparse embedding
+        try:
+            # Initialize BM25 encoder with default parameters
+            bm25 = BM25Encoder.default()
+            
+            # Encode the text as a sparse vector for queries
+            sparse_vector = bm25.encode_queries(text)
+            
+            # Return both dense and sparse embeddings
+            return {
+                "dense": dense_embedding,
+                "sparse": sparse_vector
+            }
+        except ImportError:
+            logger.info("Warning: pinecone_text not installed. Falling back to dense-only search.")
+    
     except Exception as e:
-        print(f"Error generating embedding: {e}")
-        # Return a zero embedding as fallback
-        zero_embedding = [0.0] * 768  # Gemini embedding dimension
-        return zero_embedding
+        logger.error(f"Error generating embedding: {e}")
+
 
 def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Search for evidence supporting a claim in the Pinecone index"""
+    """Search for evidence supporting a claim in the Pinecone index using hybrid search"""
     try:
-        # Get embedding for the claim
-        embedding = get_embedding(claim)
+        # Get embeddings for the claim
+        embeddings = get_embedding(claim)
+        
+        # Prepare query parameters
+        query_params = {
+            "vector": embeddings["dense"],
+            "top_k": top_k,
+            "include_metadata": True
+        }
+        
+        # Add sparse vector if available for hybrid search
+        if embeddings["sparse"] is not None:
+            query_params["sparse_vector"] = embeddings["sparse"]
         
         # Query Pinecone index
         index = pc.Index(INDEX_NAME)
-        results = index.query(
-            vector=embedding,
-            top_k=top_k,
-            include_metadata=True
-        )
+        results = index.query(**query_params)
         
         # Extract and return results
         evidence = []
@@ -71,7 +137,7 @@ def search_evidence(claim: str, top_k: int = 5) -> List[Dict[str, Any]]:
         
         return evidence
     except Exception as e:
-        print(f"Error searching for evidence: {e}")
+        logger.error(f"Error searching for evidence: {e}")
         return []
 
 def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> str:
@@ -118,14 +184,14 @@ def generate_explanation(claim: str, evidence_list: List[Dict[str, Any]]) -> str
         return explanation
     
     except Exception as e:
-        print(f"Error generating explanation: {e}")
+        logger.error(f"Error generating explanation: {e}")
         return "Unable to generate explanation due to an error."
 
 def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, include_explanation: bool = True):
     """Verify claims against the Pinecone index and save results"""
     # Load claims
     claims = load_claims(claims_file)
-    print(f"Loaded {len(claims)} claims from {claims_file}")
+    logger.info(f"Loaded {len(claims)} claims from {claims_file}")
     
     # Process each claim
     results = []
@@ -134,18 +200,24 @@ def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, inc
         if not claim_text:
             continue
         
-        # Search for evidence
-        evidence = search_evidence(claim_text, top_k=top_k)
+        # Preprocess the claim - use this for all operations except final storage
+        preprocessed_claim = preprocess_claim(claim_text)
         
-        # Generate explanation if requested
+        # Search for evidence using preprocessed claim
+        evidence = search_evidence(preprocessed_claim, top_k=top_k)
+        
+        # Generate explanation if requested - use preprocessed claim
         explanation = ""
         if include_explanation and evidence:
-            print(f"Generating explanation for: {claim_text[:50]}...")
-            explanation = generate_explanation(claim_text, evidence)
+            # Log the preprocessed claim
+            log_text = preprocessed_claim if len(preprocessed_claim) < 200 else f"{preprocessed_claim[:197]}..."
+            logger.info(f"Generating explanation for claim: {log_text}")
+            # Use preprocessed claim for explanation
+            explanation = generate_explanation(preprocessed_claim, evidence)
         
-        # Add to results
+        # Add to results - use original claim text, not the preprocessed one with context
         results.append({
-            "claim": claim_text,
+            "claim": claim_text,  # Original claim without added context
             "evidence": evidence,
             "explanation": explanation
         })
@@ -154,7 +226,7 @@ def verify_claims(claims_file: str, output_file: str = None, top_k: int = 5, inc
     if output_file:
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump({"results": results}, f, indent=2, ensure_ascii=False)
-        print(f"Saved results to {output_file}")
+        logger.info(f"Saved results to {output_file}")
     
     return results
 
@@ -222,66 +294,7 @@ def format_results(results: List[Dict[str, Any]], output_format: str = "md") -> 
                 output += "---\n\n"
         
         return output
-    
-    elif output_format.lower() == "html":
-        # Format as HTML
-        output = "<!DOCTYPE html>\n<html>\n<head>\n"
-        output += "<meta charset='utf-8'>\n"
-        output += "<title>Flublok Claims Verification Results</title>\n"
-        output += "<style>\n"
-        output += "body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }\n"
-        output += ".claim { margin-bottom: 30px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }\n"
-        output += ".explanation { margin: 15px 0; padding: 15px; background-color: #f0f7ff; border-left: 3px solid #0066cc; }\n"
-        output += ".evidence { margin: 15px 0; padding: 10px; background-color: #f9f9f9; border-left: 3px solid #007bff; }\n"
-        output += "h1, h2 { color: #333; }\n"
-        output += "h3 { color: #007bff; }\n"
-        output += ".score { color: #28a745; font-weight: bold; }\n"
-        output += ".source { color: #6c757d; font-style: italic; }\n"
-        output += ".paragraph { color: #dc3545; font-weight: bold; }\n"
-        output += "hr { margin: 30px 0; }\n"
-        output += "</style>\n"
-        output += "</head>\n<body>\n"
-        output += "<h1>Flublok Claims Verification Results</h1>\n"
-        
-        for i, result in enumerate(results):
-            claim = result.get("claim", "")
-            evidence = result.get("evidence", [])
-            explanation = result.get("explanation", "")
-            
-            output += f"<div class='claim'>\n"
-            output += f"<h2>Claim {i+1}</h2>\n"
-            output += f"<p><strong>{claim}</strong></p>\n"
-            
-            # Add explanation if available
-            if explanation:
-                output += "<h3>Analysis</h3>\n"
-                output += f"<div class='explanation'>\n"
-                output += f"<p>{explanation}</p>\n"
-                output += "</div>\n"
-            
-            if evidence:
-                output += "<h3>Supporting Evidence</h3>\n"
-                for j, item in enumerate(evidence):
-                    score = item.get("score", 0)
-                    doc_name = item.get("document_name", "Unknown")
-                    paragraph_index = item.get("paragraph_index", -1)
-                    text = item.get("text", "No text available")
-                    
-                    output += f"<div class='evidence'>\n"
-                    output += f"<h4>Evidence {j+1}</h4>\n"
-                    output += f"<p class='score'>Score: {score:.4f}</p>\n"
-                    output += f"<p class='source'>Source: {doc_name}</p>\n"
-                    output += f"<p class='paragraph'>Paragraph: {paragraph_index}</p>\n"
-                    output += f"<p>{text}</p>\n"
-                    output += "</div>\n"
-            else:
-                output += "<p>No supporting evidence found.</p>\n"
-            
-            output += "</div>\n"
-            output += "<hr>\n"
-        
-        output += "</body>\n</html>"
-        return output
+
     
     else:  # Plain text
         # Format as plain text
@@ -320,21 +333,6 @@ def format_results(results: List[Dict[str, Any]], output_format: str = "md") -> 
         
         return output
 
-def test_embedding_api():
-    """Test the embedding API to ensure it's working correctly"""
-    test_text = "This is a test claim about Flublok vaccine."
-    try:
-        embedding = get_embedding(test_text)
-        if embedding and len(embedding) > 0 and not all(v == 0 for v in embedding):
-            print("✅ Embedding API test successful!")
-            return True
-        else:
-            print("❌ Embedding API returned zeros or empty embedding.")
-            return False
-    except Exception as e:
-        print(f"❌ Embedding API test failed: {e}")
-        return False
-
 def main():
     """Main function to run the script"""
     # Parse command line arguments
@@ -347,16 +345,13 @@ def main():
                         help="Output file to save results in custom format (JSON)")
     parser.add_argument("--report_file", type=str, default=None,
                         help="Output file to save formatted report")
-    parser.add_argument("--report_format", type=str, choices=["md", "html", "txt"], default="md",
-                        help="Format for the report (md, html, or txt)")
+    parser.add_argument("--report_format", type=str, choices=["md", "txt"], default="md",
+                        help="Format for the report (md, or txt)")
     parser.add_argument("--top_k", type=int, default=5,
                         help="Number of evidence items to retrieve per claim")
     parser.add_argument("--no_explanation", action="store_true",
                         help="Skip generating explanations for claims")
     args = parser.parse_args()
-    
-    # Test the embedding API
-    test_embedding_api()
     
     # Verify claims
     results = verify_claims(
@@ -371,16 +366,16 @@ def main():
         custom_output = format_custom_output(results)
         with open(args.custom_output_file, 'w', encoding='utf-8') as f:
             json.dump(custom_output, f, indent=2, ensure_ascii=False)
-        print(f"Saved custom format results to {args.custom_output_file}")
+        logger.info(f"Saved custom format results to {args.custom_output_file}")
     
     # Generate and save report if requested
     if args.report_file:
         report = format_results(results, args.report_format)
         with open(args.report_file, 'w', encoding='utf-8') as f:
             f.write(report)
-        print(f"Saved report to {args.report_file}")
+        logger.info(f"Saved report to {args.report_file}")
     
-    print("Verification complete!")
+    logger.info("Verification complete!")
 
 if __name__ == "__main__":
     main() 

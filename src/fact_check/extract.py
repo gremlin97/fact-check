@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List
 from tqdm import tqdm
@@ -11,6 +12,12 @@ from docling.document_converter import DocumentConverter
 from dotenv import load_dotenv
 import argparse
 import sys
+from pinecone_text.sparse import BM25Encoder
+import textwrap
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -39,19 +46,26 @@ def create_pinecone_index_if_not_exists():
     """Create Pinecone index if it doesn't exist"""
     try:
         if INDEX_NAME not in pc.list_indexes().names():
-            print(f"Creating Pinecone index: {INDEX_NAME}")
+            logger.info(f"Creating Pinecone index: {INDEX_NAME}")
             pc.create_index(
                 name=INDEX_NAME,
                 dimension=768,  # Gemini embedding dimension
-                metric="cosine",
+                metric="dotproduct",  # Use dotproduct to support sparse vectors
                 spec=ServerlessSpec(cloud="aws", region="us-east-1")
             )
-            print(f"Successfully created index: {INDEX_NAME}")
+            logger.info(f"Successfully created index: {INDEX_NAME}")
         else:
-            print(f"Using existing Pinecone index: {INDEX_NAME}")
+            # Check if the existing index supports sparse vectors
+            index_info = pc.describe_index(INDEX_NAME)
+            logger.info(f"Index info: {index_info}")
+            
+            # Log index details to debug sparse vector support
+            if hasattr(index_info, 'metric') and index_info.metric != 'dotproduct':
+                logger.warning(f"Existing index uses {index_info.metric} metric which may not support sparse vectors. Consider recreating with dotproduct metric.")
+                
         return pc.Index(INDEX_NAME)
     except Exception as e:
-        print(f"Error with Pinecone: {e}")
+        logger.error(f"Error with Pinecone: {e}")
         raise
 
 def extract_text_from_pdf(pdf_path: str, save_markdown: bool = False) -> str:
@@ -68,11 +82,11 @@ def extract_text_from_pdf(pdf_path: str, save_markdown: bool = False) -> str:
             markdown_file_path = pdf_file_path.with_suffix('.md')
             with open(markdown_file_path, 'w', encoding='utf-8') as f:
                 f.write(markdown_text)
-            print(f"Saved markdown to {markdown_file_path}")
+            logger.info(f"Saved markdown to {markdown_file_path}")
             
         return markdown_text
     except Exception as e:
-        print(f"Docling conversion failed: {e}. Falling back to PyPDF.")
+        logger.info(f"Docling conversion failed: {e}. Falling back to PyPDF.")
         # Fallback to PyPDF
         reader = PdfReader(pdf_path)
         text = ""
@@ -80,8 +94,18 @@ def extract_text_from_pdf(pdf_path: str, save_markdown: bool = False) -> str:
             text += page.extract_text() + "\n"
         return text
 
-def chunk_text_by_paragraphs(text: str) -> List[str]:
-    """Split text into paragraphs, handling markdown formatting"""
+def chunk_text_by_paragraphs(text: str, max_length: int = 2500, min_length: int = 1000, overlap: int = 1) -> List[str]:
+    """Split text into paragraphs, handling markdown formatting with overlap between chunks
+    
+    Args:
+        text: The text to split into paragraphs
+        max_length: Maximum length of each paragraph (default: 1500)
+        min_length: Minimum preferred length for paragraphs (default: 300)
+        overlap: Number of paragraphs to overlap between chunks (default: 1)
+        
+    Returns:
+        List of paragraph strings
+    """
     # Split by double newlines or multiple newlines
     paragraphs = re.split(r'\n\s*\n', text)
     
@@ -95,15 +119,99 @@ def chunk_text_by_paragraphs(text: str) -> List[str]:
         # Skip markdown horizontal rules
         if re.match(r'^[-*_]{3,}\s*$', p):
             continue
+        
+        # Add the paragraph (header or regular text)
+        processed_paragraphs.append(p)
+        
+        # If paragraph exceeds max_length, split it
+        if len(p) > max_length:
+            # Remove the current paragraph
+            processed_paragraphs.pop()
             
-        # Handle markdown headers but keep the content
-        if p.startswith('#'):
-            # Keep the header as part of the paragraph
-            processed_paragraphs.append(p)
-        else:
-            processed_paragraphs.append(p)
+            # Split long paragraphs by sentences or chunks
+            sentences = re.split(r'(?<=[.!?])\s+', p)
+            current_chunk = ""
+            
+            for sentence in sentences:
+                if len(current_chunk) + len(sentence) <= max_length:
+                    if current_chunk:
+                        current_chunk += " " + sentence
+                    else:
+                        current_chunk = sentence
+                else:
+                    if current_chunk:
+                        processed_paragraphs.append(current_chunk)
+                    
+                    # If a single sentence is longer than max_length, split it into chunks
+                    if len(sentence) > max_length:
+                        for i in range(0, len(sentence), max_length):
+                            chunk = sentence[i:i+max_length]
+                            processed_paragraphs.append(chunk)
+                        current_chunk = ""
+                    else:
+                        current_chunk = sentence
+            
+            # Add the last chunk if there is one
+            if current_chunk:
+                processed_paragraphs.append(current_chunk)
     
-    return processed_paragraphs
+    # Additional logic to handle very short paragraphs by potentially combining them
+    # if they're related (e.g., part of a list or consecutive sections on the same topic)
+    
+    final_paragraphs = []
+    current_combined = ""
+    
+    for p in processed_paragraphs:
+        # Don't combine headers
+        if p.startswith('#'):
+            if current_combined:
+                final_paragraphs.append(current_combined)
+                current_combined = ""
+            final_paragraphs.append(p)
+        elif len(p) < min_length and len(current_combined) + len(p) + 1 <= max_length:
+            # Combine very short paragraphs when possible
+            if current_combined:
+                current_combined += "\n\n" + p
+            else:
+                current_combined = p
+        else:
+            if current_combined:
+                final_paragraphs.append(current_combined)
+                current_combined = ""
+            final_paragraphs.append(p)
+    
+    # Add any remaining combined paragraph
+    if current_combined:
+        final_paragraphs.append(current_combined)
+    
+    # Create overlapping chunks if overlap > 0
+    if overlap > 0 and len(final_paragraphs) > 1:
+        overlapped_paragraphs = []
+        
+        # Create sliding window of paragraphs
+        for i in range(0, len(final_paragraphs), max(1, overlap)):
+            # Create a chunk with 'overlap' paragraphs (or fewer if near the end)
+            chunk_size = min(overlap * 2, len(final_paragraphs) - i)
+            if chunk_size <= 0:
+                break
+                
+            # Combine paragraphs in this chunk
+            chunk_text = ""
+            for j in range(chunk_size):
+                if j > 0:
+                    chunk_text += "\n\n"
+                chunk_text += final_paragraphs[i + j]
+            
+            overlapped_paragraphs.append(chunk_text)
+        
+        # If the last chunk doesn't reach the end, add a final chunk
+        if overlapped_paragraphs and i + chunk_size < len(final_paragraphs):
+            final_chunk = "\n\n".join(final_paragraphs[-(overlap*2):])
+            overlapped_paragraphs.append(final_chunk)
+            
+        return overlapped_paragraphs
+        
+    return final_paragraphs
 
 def save_paragraphs(paragraphs: List[str], output_path: str, format: str = "md"):
     """Save paragraphs to a file in the specified format"""
@@ -116,14 +224,14 @@ def save_paragraphs(paragraphs: List[str], output_path: str, format: str = "md")
                 f.write(f"## Paragraph {i+1}\n\n")
                 f.write(f"{paragraph}\n\n")
                 f.write("---\n\n")
-        print(f"Saved paragraphs as markdown to {output_path.with_suffix('.md')}")
+        logger.info(f"Saved paragraphs as markdown to {output_path.with_suffix('.md')}")
     
     elif format.lower() == "json":
         # Save as JSON
         paragraphs_data = [{"id": i, "text": p} for i, p in enumerate(paragraphs)]
         with open(output_path.with_suffix('.json'), 'w', encoding='utf-8') as f:
             json.dump(paragraphs_data, f, indent=2, ensure_ascii=False)
-        print(f"Saved paragraphs as JSON to {output_path.with_suffix('.json')}")
+        logger.info(f"Saved paragraphs as JSON to {output_path.with_suffix('.json')}")
     
     elif format.lower() == "txt":
         # Save as plain text
@@ -132,92 +240,106 @@ def save_paragraphs(paragraphs: List[str], output_path: str, format: str = "md")
                 f.write(f"=== Paragraph {i+1} ===\n\n")
                 f.write(f"{paragraph}\n\n")
                 f.write("="*40 + "\n\n")
-        print(f"Saved paragraphs as text to {output_path.with_suffix('.txt')}")
-    
-    elif format.lower() == "html":
-        # Save as HTML
-        with open(output_path.with_suffix('.html'), 'w', encoding='utf-8') as f:
-            f.write("<!DOCTYPE html>\n<html>\n<head>\n")
-            f.write("<meta charset='utf-8'>\n")
-            f.write("<title>Extracted Paragraphs</title>\n")
-            f.write("<style>\n")
-            f.write("body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }\n")
-            f.write(".paragraph { margin-bottom: 30px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }\n")
-            f.write("h2 { color: #333; }\n")
-            f.write("hr { margin: 30px 0; }\n")
-            f.write("</style>\n")
-            f.write("</head>\n<body>\n")
-            f.write("<h1>Extracted Paragraphs</h1>\n")
-            
-            for i, paragraph in enumerate(paragraphs):
-                f.write(f"<div class='paragraph'>\n")
-                f.write(f"<h2>Paragraph {i+1}</h2>\n")
-                # Convert markdown headers to HTML
-                if paragraph.startswith('#'):
-                    header_level = len(re.match(r'^#+', paragraph).group())
-                    header_text = paragraph[header_level:].strip()
-                    f.write(f"<h{header_level}>{header_text}</h{header_level}>\n")
-                else:
-                    # Replace newlines with <br> tags
-                    html_paragraph = paragraph.replace('\n', '<br>\n')
-                    f.write(f"<p>{html_paragraph}</p>\n")
-                f.write("</div>\n")
-                f.write("<hr>\n")
-            
-            f.write("</body>\n</html>")
-        print(f"Saved paragraphs as HTML to {output_path.with_suffix('.html')}")
+        logger.info(f"Saved paragraphs as text to {output_path.with_suffix('.txt')}")
     
     else:
-        print(f"Unsupported format: {format}")
+        logger.info(f"Unsupported format: {format}")
 
-def get_embeddings(text: str) -> Dict[str, List[float]]:
-    """Get dense and sparse embeddings from Gemini"""
+def get_embeddings(text: str, context_paragraphs: List[str] = None) -> Dict[str, List[float]]:
+    """Get dense and sparse embeddings from Gemini with optional context
+    
+    Args:
+        text: The main text to embed
+        context_paragraphs: Optional list of surrounding paragraphs for context
+    
+    Returns:
+        Dictionary with dense and sparse embeddings
+    """
     try:
-        # Use the embedding API
+        # Prepare text with context if provided, but keep original text
+        if context_paragraphs:
+            # Create context string to prepend
+            context_string = textwrap.dedent(f"""\
+            <document>
+            {' '.join(context_paragraphs)}
+            </document>
+            Here is the chunk we want to situate within the whole document
+            <chunk>
+            {text}
+            </chunk>
+            
+            """)
+            
+            # Prepend context to original text
+            contextual_text = context_string + text
+        else:
+            contextual_text = text
+            
+        # Use the embedding API for dense embeddings
         result = genai.embed_content(
             model="models/embedding-001",
-            content=text,
+            content=contextual_text,
             task_type="retrieval_document",
             title="Medical document"
         )
         
-        # Extract embeddings
-        embedding = result["embedding"]
+        # Extract dense embeddings
+        dense_embedding = result["embedding"]
         
-        # For this example, we're using the same embedding for both dense and sparse
-        # In a real implementation, you might want to generate proper sparse embeddings
-        return {
-            "dense": embedding,
-            "sparse": {"indices": list(range(len(embedding))), "values": embedding}
-        }
+        # Generate proper sparse embeddings using BM25
+        try:
+            # Initialize BM25 encoder with default parameters
+            bm25 = BM25Encoder.default()
+            
+            # Encode the text as a sparse vector
+            sparse_vector = bm25.encode_documents(contextual_text)
+            
+            # Return both dense and proper sparse embeddings
+            return {
+                "dense": dense_embedding,
+                "sparse": sparse_vector
+            }
+        except Exception as e:
+            logger.error(f"Error generating sparse embeddings: {e}")
+            return None
     except Exception as e:
-        print(f"Error generating embeddings: {e}")
-        # Return a zero embedding as fallback
-        zero_embedding = [0.0] * 768  # Gemini embedding dimension
-        return {
-            "dense": zero_embedding,
-            "sparse": {"indices": list(range(len(zero_embedding))), "values": zero_embedding}
-        }
+        logger.error(f"Error generating embeddings: {e}")
+        return None
 
-def process_pdf_directory(pdf_dir: str, batch_size: int = 100, save_markdown: bool = False, save_paragraphs_format: str = None):
-    """Process all PDFs in a directory and upload to Pinecone"""
-    pdf_dir_path = Path(pdf_dir)
+def process_pdf_directory(pdf_dir: str, batch_size: int = 100, save_markdown: bool = False, 
+                       save_paragraphs_format: str = None, context_window_size: int = 2, overlap: int = 1):
+    """Process all PDFs in a directory and upload to Pinecone
     
-    # Create directory if it doesn't exist
-    if not pdf_dir_path.exists():
-        print(f"Creating directory: {pdf_dir}")
-        pdf_dir_path.mkdir(parents=True, exist_ok=True)
+    Args:
+        pdf_dir: Directory containing PDF files
+        batch_size: Batch size for uploading vectors to Pinecone
+        save_markdown: Whether to save markdown output
+        save_paragraphs_format: Format to save extracted paragraphs (md, json, txt, html)
+        context_window_size: Number of paragraphs before and after to include as context
+        overlap: Number of paragraphs to overlap between chunks
+    """
+    pdf_dir_path = Path(pdf_dir)
     
     pdf_files = list(pdf_dir_path.glob("**/*.pdf"))
     
     if not pdf_files:
-        print(f"No PDF files found in {pdf_dir}")
+        logger.info(f"No PDF files found in {pdf_dir}")
         return
     
-    print(f"Found {len(pdf_files)} PDF files")
+    logger.info(f"Found {len(pdf_files)} PDF files")
     
     # Create Pinecone index
     index = create_pinecone_index_if_not_exists()
+    
+    # Check if sparse vectors are supported
+    try:
+        index_info = pc.describe_index(INDEX_NAME)
+        supports_sparse = hasattr(index_info, 'metric') and index_info.metric == 'dotproduct'
+        if not supports_sparse:
+            logger.warning("Index does not support sparse vectors. Only using dense vectors.")
+    except Exception:
+        supports_sparse = False
+        logger.warning("Could not determine if index supports sparse vectors. Only using dense vectors.")
     
     # Process PDFs
     batch = []
@@ -226,8 +348,8 @@ def process_pdf_directory(pdf_dir: str, batch_size: int = 100, save_markdown: bo
             # Extract text from PDF using docling
             text = extract_text_from_pdf(str(pdf_file), save_markdown=save_markdown)
             
-            # Chunk text by paragraphs
-            paragraphs = chunk_text_by_paragraphs(text)
+            # Chunk text by paragraphs with overlap
+            paragraphs = chunk_text_by_paragraphs(text, overlap=overlap)
             
             # Save paragraphs if requested
             if save_paragraphs_format:
@@ -245,43 +367,58 @@ def process_pdf_directory(pdf_dir: str, batch_size: int = 100, save_markdown: bo
                 if is_header:
                     header_level = len(re.match(r'^#+', paragraph).group())
                 
-                # Create metadata
+                # Create metadata with overlap information
                 metadata = {
                     "document_name": pdf_file.name,
                     "document_path": str(pdf_file),
                     "paragraph_index": i,
                     "is_header": is_header,
                     "header_level": header_level,
-                    "text": paragraph
+                    "text": paragraph,
+                    "overlap": overlap,
+                    "has_overlap": i > 0  # First chunk doesn't have preceding text overlap
                 }
                 
-                # Get embeddings
-                embeddings = get_embeddings(paragraph)
+                # Get context paragraphs (surrounding paragraphs)
+                start_idx = max(0, i - context_window_size)
+                end_idx = min(len(paragraphs), i + context_window_size + 1)
+                context_paragraphs = paragraphs[start_idx:i] + paragraphs[i+1:end_idx]
+                
+                # Get embeddings with context
+                embeddings = get_embeddings(paragraph, context_paragraphs)
+                
+                if embeddings is None:
+                    logger.warning(f"Failed to get embeddings for paragraph {i} in {pdf_file.name}")
+                    continue
                 
                 # Create vector record
                 vector_id = f"{pdf_file.stem}_p{i}"
                 vector = {
                     "id": vector_id,
                     "values": embeddings["dense"],
-                    "sparse_values": embeddings["sparse"],
                     "metadata": metadata
                 }
                 
+                # Only add sparse values if the index supports them
+                if supports_sparse:
+                    vector["sparse_values"] = embeddings["sparse"]
+                
+                # Validate vector before appending to batch
                 batch.append(vector)
                 
                 # Upload in batches
                 if len(batch) >= batch_size:
                     index.upsert(vectors=batch)
                     batch = []
-                    print(f"Uploaded batch of {batch_size} vectors")
+                    logger.info(f"Uploaded batch of {batch_size} vectors")
         
         except Exception as e:
-            print(f"Error processing {pdf_file}: {e}")
+            logger.error(f"Error processing {pdf_file}: {e}")
     
     # Upload any remaining vectors
     if batch:
         index.upsert(vectors=batch)
-        print(f"Uploaded final batch of {len(batch)} vectors")
+        logger.info(f"Uploaded final batch of {len(batch)} vectors")
 
 def main():
     """Main function to run the script"""
@@ -295,53 +432,54 @@ def main():
                         help="Run in test mode (only extract text, don't upload to Pinecone)")
     parser.add_argument("--save_markdown", action="store_true",
                         help="Save the markdown generated by docling to files")
-    parser.add_argument("--save_paragraphs", type=str, choices=["md", "json", "txt", "html"],
-                        help="Save paragraphs in the specified format (md, json, txt, or html)")
+    parser.add_argument("--save_paragraphs", type=str, choices=["md", "json", "txt"],
+                        help="Save paragraphs in the specified format (md, json, txt)")
+    parser.add_argument("--context_window_size", type=int, default=2,
+                        help="Number of paragraphs before and after to include as context (default: 2)")
+    parser.add_argument("--overlap", type=int, default=1, 
+                        help="Number of paragraphs to overlap between chunks (default: 1)")
     args = parser.parse_args()
     
     if args.test:
         # Test mode - just extract text from PDFs
         pdf_dir_path = Path(args.pdf_dir)
         
-        # Create directory if it doesn't exist
-        if not pdf_dir_path.exists():
-            print(f"Creating directory: {args.pdf_dir}")
-            pdf_dir_path.mkdir(parents=True, exist_ok=True)
-        
         pdf_files = list(pdf_dir_path.glob("**/*.pdf"))
         
         if not pdf_files:
-            print(f"No PDF files found in {args.pdf_dir}")
+            logger.info(f"No PDF files found in {args.pdf_dir}")
             return
         
-        print(f"Found {len(pdf_files)} PDF files")
+        logger.info(f"Found {len(pdf_files)} PDF files")
         
         # Process first PDF file as a test
         if pdf_files:
             test_file = pdf_files[0]
-            print(f"Testing extraction on: {test_file}")
+            logger.info(f"Testing extraction on: {test_file}")
             try:
                 text = extract_text_from_pdf(str(test_file), save_markdown=args.save_markdown)
-                paragraphs = chunk_text_by_paragraphs(text)
-                print(f"Successfully extracted {len(paragraphs)} paragraphs")
+                paragraphs = chunk_text_by_paragraphs(text, overlap=args.overlap)
+                logger.info(f"Successfully extracted {len(paragraphs)} paragraphs with {args.overlap} paragraph overlap")
                 
                 # Save paragraphs if requested
                 if args.save_paragraphs:
                     output_path = test_file.with_name(f"{test_file.stem}_paragraphs")
                     save_paragraphs(paragraphs, output_path, format=args.save_paragraphs)
                 
-                print("\nSample paragraphs:")
+                logger.info("\nSample paragraphs:")
                 for i, p in enumerate(paragraphs[:3]):  # Show first 3 paragraphs
-                    print(f"\nParagraph {i+1}:\n{p[:200]}...")
+                    logger.info(f"\nParagraph {i+1}:\n{p[:200]}...")
             except Exception as e:
-                print(f"Error during test extraction: {e}")
+                logger.error(f"Error during test extraction: {e}")
     else:
         # Normal mode - process PDFs and upload to Pinecone
         process_pdf_directory(args.pdf_dir, args.batch_size, 
                              save_markdown=args.save_markdown,
-                             save_paragraphs_format=args.save_paragraphs)
+                             save_paragraphs_format=args.save_paragraphs,
+                             context_window_size=args.context_window_size,
+                             overlap=args.overlap)
     
-    print("Processing complete!")
+        logger.info("Processing complete!")
 
 if __name__ == "__main__":
     main()
